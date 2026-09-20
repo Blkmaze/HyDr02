@@ -1,3 +1,4 @@
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/account.dart';
 import '../models/profile.dart';
@@ -13,15 +14,33 @@ class Storage {
   static const _kFavPrefix = 'favorites_v1_'; // + profileId (or 'shared')
   static const _kOtaSkip = 'ota_skip_build';
 
+  // Server list + saved logins carry Xtream/M3U credentials, so they live in
+  // Keystore-backed secure storage rather than plain-text SharedPreferences
+  // (which is just an XML file readable by anything with root/adb access to
+  // the device). Everything else below is non-sensitive (favorites, last
+  // channel, UI prefs) and stays on SharedPreferences.
+  static const _secure = FlutterSecureStorage(
+    aOptions: AndroidOptions(encryptedSharedPreferences: true),
+  );
+
   // ---- legacy single-account shim (kept so old saved logins still work) ----
   static Future<Account?> loadAccount() async {
+    final secureVal = await _secure.read(key: _kAccount);
+    if (secureVal != null) return Account.fromJson(secureVal);
+    // One-time migration: an older build may still have this in plain-text
+    // SharedPreferences. Move it into secure storage and wipe the plain copy.
     final p = await SharedPreferences.getInstance();
-    final s = p.getString(_kAccount);
-    return s == null ? null : Account.fromJson(s);
+    final legacy = p.getString(_kAccount);
+    if (legacy == null) return null;
+    await _secure.write(key: _kAccount, value: legacy);
+    await p.remove(_kAccount);
+    return Account.fromJson(legacy);
   }
 
   static Future<void> clear() async {
     final p = await SharedPreferences.getInstance();
+    await _secure.delete(key: _kAccount);
+    await _secure.delete(key: _kServers);
     await p.remove(_kAccount);
     await p.remove(_kServers);
     await p.remove(_kActiveServer);
@@ -68,11 +87,19 @@ class Storage {
   /// Returns the saved server list, migrating a legacy single [_kAccount]
   /// into it the first time this runs after an update.
   static Future<List<ServerConfig>> loadServers() async {
-    final p = await SharedPreferences.getInstance();
-    final raw = p.getString(_kServers);
-    if (raw != null) return ServerConfig.decodeList(raw);
+    final secureRaw = await _secure.read(key: _kServers);
+    if (secureRaw != null) return ServerConfig.decodeList(secureRaw);
 
-    final legacy = p.getString(_kAccount);
+    // One-time migration from an older build's plain-text SharedPreferences copy.
+    final p = await SharedPreferences.getInstance();
+    final legacyServers = p.getString(_kServers);
+    if (legacyServers != null) {
+      await _secure.write(key: _kServers, value: legacyServers);
+      await p.remove(_kServers);
+      return ServerConfig.decodeList(legacyServers);
+    }
+
+    final legacy = await _secure.read(key: _kAccount) ?? p.getString(_kAccount);
     if (legacy == null) return [];
     final migrated = [
       ServerConfig(id: _newId(), nickname: 'My Server', account: Account.fromJson(legacy)),
@@ -83,8 +110,7 @@ class Storage {
   }
 
   static Future<void> saveServers(List<ServerConfig> servers) async {
-    final p = await SharedPreferences.getInstance();
-    await p.setString(_kServers, ServerConfig.encodeList(servers));
+    await _secure.write(key: _kServers, value: ServerConfig.encodeList(servers));
   }
 
   static Future<String?> activeServerId() async {

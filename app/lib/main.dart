@@ -5,6 +5,7 @@ import 'services/live_stream_tuning.dart';
 import 'config/theme_controller.dart';
 import 'services/storage.dart';
 import 'ui/home_screen.dart';
+import 'ui/idle_screensaver.dart';
 import 'ui/login_screen.dart';
 import 'ui/sign_in_method_screen.dart';
 import 'ui/splash_screen.dart';
@@ -59,6 +60,7 @@ class MazeTvApp extends StatelessWidget {
               ? const HomeScreen()
               : (b.pairBaseUrl.isNotEmpty ? const SignInMethodScreen() : const LoginScreen()),
         ),
+        builder: (context, child) => IdleWatcher(child: child ?? const SizedBox()),
         );
       },
     );
