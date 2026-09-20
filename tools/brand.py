@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""
+Stamps branding into a freshly `flutter create`d Android project.
+
+  brand.py --project build/proj --app-name "Maze TV" --package com.example.mazetv \
+           --color "#E50914" [--portal-url ...] [--epg-url ...] [--vpn-url ...] \
+           [--support-text ...] [--icon path-or-url]
+
+What it does:
+  1. writes assets/branding.json (read by the app at startup)
+  2. sets applicationId + minSdk in android/app/build.gradle(.kts)
+  3. patches AndroidManifest.xml for Android TV / Fire TV (leanback launcher,
+     banner, no-touchscreen, INTERNET/WAKE_LOCK, cleartext http)
+  4. generates launcher icons + TV banner (from --icon or auto-made initials)
+"""
+import argparse, io, json, os, re, sys, urllib.request
+from PIL import Image, ImageDraw, ImageFont
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--project", required=True)
+ap.add_argument("--app-name", required=True)
+ap.add_argument("--package", required=True)
+ap.add_argument("--color", default="#E50914")
+ap.add_argument("--portal-url", default="")
+ap.add_argument("--epg-url", default="")
+ap.add_argument("--vpn-url", default="")
+ap.add_argument("--support-text", default="")
+ap.add_argument("--icon", default="")
+ap.add_argument("--portals", default="[]", help='JSON list like [{"name":"My Server","host":"http://portal.example.com:8080"}]')
+ap.add_argument("--pair-base-url", default="")
+ap.add_argument("--tmdb-api-key", default="", help="optional TMDB v3 API key for real Popular rows")
+ap.add_argument("--repo", default="", help="owner/name this build is published from (for in-app OTA update checks)")
+ap.add_argument("--build-number", default="0", help="GitHub Actions run number for this build")
+ap.add_argument("--vod-only", default="false", help="true = movies & series only; Live TV, guide, catch-up, multiview and recordings are removed")
+a = ap.parse_args()
+
+P = a.project
+if not re.fullmatch(r"[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+", a.package):
+    sys.exit(f"Bad package id: {a.package} (use e.g. com.mybrand.tv)")
+color = a.color if a.color.startswith("#") else "#" + a.color
+if not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+    sys.exit(f"Bad color: {a.color} (use #RRGGBB)")
+
+# 1. branding.json -----------------------------------------------------------
+os.makedirs(f"{P}/assets", exist_ok=True)
+try:
+    portals = json.loads(a.portals)
+    assert isinstance(portals, list)
+except Exception:
+    sys.exit(f"--portals must be a JSON list, got: {a.portals}")
+
+with open(f"{P}/assets/branding.json", "w") as f:
+    json.dump({
+        "app_name": a.app_name, "primary_color": color, "portal_url": a.portal_url,
+        "epg_url": a.epg_url, "vpn_config_url": a.vpn_url, "support_text": a.support_text,
+        "portals": portals, "pair_base_url": a.pair_base_url, "tmdb_api_key": a.tmdb_api_key,
+        "repo": a.repo, "build_number": int(a.build_number or 0),
+        "has_custom_logo": True,
+        "vod_only": str(a.vod_only).strip().lower() in ("1", "true", "yes", "on"),
+    }, f, indent=2)
+print("[brand] wrote branding.json")
+
+# 2. gradle ------------------------------------------------------------------
+def patch(path, subs):
+    s = open(path).read()
+    for pat, rep in subs:
+        s, n = re.subn(pat, rep, s, count=1)
+        if n == 0:
+            print(f"[brand] WARN pattern not found in {os.path.basename(path)}: {pat}")
+    open(path, "w").write(s)
+
+gradle = f"{P}/android/app/build.gradle.kts"
+if os.path.exists(gradle):
+    patch(gradle, [
+        (r'applicationId\s*=\s*"[^"]+"', f'applicationId = "{a.package}"'),
+        # No ndk.abiFilters here: Flutter's --target-platform / --split-per-abi
+        # already restrict the ABIs, and AGP refuses abiFilters + splits together.
+        (r'minSdk\s*=\s*[^\n]+', 'minSdk = 21'),
+    ])
+else:
+    gradle = f"{P}/android/app/build.gradle"
+    patch(gradle, [
+        (r'applicationId\s+"[^"]+"', f'applicationId "{a.package}"'),
+        (r'minSdkVersion\s+[^\n]+', 'minSdkVersion 21'),
+    ])
+print(f"[brand] applicationId -> {a.package}, minSdk 21")
+
+# 3. manifest ----------------------------------------------------------------
+man = f"{P}/android/app/src/main/AndroidManifest.xml"
+s = open(man).read()
+perms = """
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
+    <uses-feature android:name="android.software.leanback" android:required="true"/>
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false"/>
+"""
+s = s.replace("<application", perms + "    <application", 1)
+# Keep the app on internal flash. Fire OS will otherwise offload it to a USB
+# drive, and an app running from USB dies the instant the drive stalls,
+# sleeps, or is reindexed -- which looks exactly like a random crash.
+if "installLocation" not in s:
+    s = s.replace("<manifest ", '<manifest android:installLocation="internalOnly" ', 1)
+s = re.sub(r'android:label="[^"]*"', f'android:label="{a.app_name}"', s, count=1)
+s = s.replace("<application", '<application\n        android:banner="@drawable/ic_banner"\n        android:usesCleartextTraffic="true"', 1)
+# Fire TV's launcher reads the banner from the *activity* that carries the
+# LEANBACK_LAUNCHER category, not from <application>. Without it here the
+# home screen shows a grey placeholder tile, whatever the app ships.
+s = re.sub(r'<activity(\s+android:name="\.MainActivity")',
+           r'<activity\n            android:banner="@drawable/ic_banner"\1', s, count=1)
+if 'android:banner' not in s.split('<activity', 1)[1].split('>', 1)[0]:
+    # template didn't use ".MainActivity" — fall back to the first activity
+    s = s.replace('<activity', '<activity\n            android:banner="@drawable/ic_banner"', 1)
+s = s.replace('<category android:name="android.intent.category.LAUNCHER"/>',
+              '<category android:name="android.intent.category.LAUNCHER"/>\n'
+              '                <category android:name="android.intent.category.LEANBACK_LAUNCHER"/>', 1)
+open(man, "w").write(s)
+print("[brand] manifest patched for Android TV")
+
+# 4. icons -------------------------------------------------------------------
+# The repo's stock icon, used whenever a build doesn't supply --icon. Lives
+# next to this script so it resolves no matter what the working directory is.
+DEFAULT_ICON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "brand-assets", "hydr0-droplet-h.png")
+
+def load_icon():
+    if a.icon:
+        data = urllib.request.urlopen(a.icon).read() if a.icon.startswith("http") else open(a.icon, "rb").read()
+        return Image.open(io.BytesIO(data)).convert("RGBA")
+    if os.path.exists(DEFAULT_ICON):
+        print("[brand] no --icon given; using the repo default icon")
+        return Image.open(DEFAULT_ICON).convert("RGBA")
+    # last resort: colored rounded square with initials
+    img = Image.new("RGBA", (512, 512), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((0, 0, 511, 511), radius=96, fill=color)
+    initials = "".join(w[0] for w in a.app_name.split()[:2]).upper() or "TV"
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 240)
+    except Exception:
+        font = ImageFont.load_default()
+    bb = d.textbbox((0, 0), initials, font=font)
+    d.text(((512 - bb[2] + bb[0]) / 2 - bb[0], (512 - bb[3] + bb[1]) / 2 - bb[1]), initials, font=font, fill="white")
+    return img
+
+icon = load_icon()
+res = f"{P}/android/app/src/main/res"
+for d, sz in {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}.items():
+    os.makedirs(f"{res}/mipmap-{d}", exist_ok=True)
+    icon.resize((sz, sz), Image.LANCZOS).save(f"{res}/mipmap-{d}/ic_launcher.png")
+
+# Same artwork, bundled as a Flutter asset so the app itself can show your
+# logo (not just the Android launcher) — see assets/logo.png in home_screen.dart.
+icon.resize((256, 256), Image.LANCZOS).save(f"{P}/assets/logo.png")
+print("[brand] logo.png bundled for in-app use" + (" (from --icon)" if a.icon else " (auto-generated)"))
+
+# TV banner 320x180 (xhdpi): icon on the left, name on the right
+ban = Image.new("RGBA", (320, 180), color)
+ban.alpha_composite(icon.resize((140, 140), Image.LANCZOS), (20, 20))
+d = ImageDraw.Draw(ban)
+try:
+    f = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
+except Exception:
+    f = ImageFont.load_default()
+d.text((175, 76), a.app_name[:14], font=f, fill="white")
+# Android TV spec: the banner is a *drawable*, 320x180 at xhdpi, scaled per
+# density. A lone mipmap-xhdpi file left Fire TV showing a grey tile.
+for dname, scale in {"mdpi": 0.5, "hdpi": 0.75, "xhdpi": 1.0, "xxhdpi": 1.5, "xxxhdpi": 2.0}.items():
+    os.makedirs(f"{res}/drawable-{dname}", exist_ok=True)
+    w, h = int(320 * scale), int(180 * scale)
+    ban.resize((w, h), Image.LANCZOS).convert("RGB").save(f"{res}/drawable-{dname}/ic_banner.png")
+# keep the old location too so nothing that still says @mipmap breaks
+os.makedirs(f"{res}/mipmap-xhdpi", exist_ok=True)
+ban.convert("RGB").save(f"{res}/mipmap-xhdpi/ic_banner.png")
+print("[brand] icons + TV banner generated")

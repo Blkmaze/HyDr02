@@ -1,0 +1,178 @@
+import 'package:flutter/material.dart';
+import '../config/branding.dart';
+import '../models/account.dart';
+import '../models/server_config.dart';
+import '../services/channel_repo.dart';
+import '../services/storage.dart';
+import 'home_screen.dart';
+import 'tv_widgets.dart';
+
+/// First-run screen: adds your one and only server to start with. Extra
+/// servers (for failover) are added later from Home → Servers.
+class LoginScreen extends StatefulWidget {
+  const LoginScreen({super.key});
+  @override
+  State<LoginScreen> createState() => _LoginScreenState();
+}
+
+class _LoginScreenState extends State<LoginScreen> {
+  SourceType mode = SourceType.xtream;
+  final host = TextEditingController(text: Branding.I.portalUrl);
+  final user = TextEditingController();
+  final pass = TextEditingController();
+  final m3u = TextEditingController();
+  final epg = TextEditingController(text: Branding.I.epgUrl);
+  bool busy = false;
+  bool manualHost = false; // "Other server" was picked from the provider list
+  bool showEpg = false;    // EPG URL is optional for Xtream; hidden until asked for
+  Portal? picked;
+  final _signIn = FocusNode();
+  final _signInKey = GlobalKey();
+
+  /// Keyboard Done on the last field: land on Sign in and make sure it's on
+  /// screen — on a 1080p TV the button sits below the fold while typing, so
+  /// it looked like there was no Sign in button at all.
+  void _toSignIn() {
+    _signIn.requestFocus();
+    Future.delayed(const Duration(milliseconds: 80), () {
+      final ctx = _signInKey.currentContext;
+      if (ctx != null && mounted) Scrollable.ensureVisible(ctx, alignment: 0.5, duration: const Duration(milliseconds: 200));
+    });
+  }
+
+  @override
+  void dispose() {
+    _signIn.dispose();
+    super.dispose();
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    final portals = Branding.I.portals;
+    if (portals.isNotEmpty) { picked = portals.first; host.text = picked!.host; }
+  }
+
+  Future<void> _go() async {
+    setState(() => busy = true);
+    try {
+      var a = mode == SourceType.xtream
+          ? Account(type: SourceType.xtream, host: _norm(host.text), username: user.text.trim(), password: pass.text.trim(), epgUrl: epg.text.trim())
+          : Account(type: SourceType.m3u, host: m3u.text.trim(), epgUrl: epg.text.trim());
+      try {
+        await ChannelRepo.I.load(a, fallbackEpg: Branding.I.epgUrl);
+      } catch (e) {
+        // Most portals are plain http; if the user typed https and it refused, retry once on http.
+        if (mode == SourceType.xtream && a.host.startsWith('https://') && e.toString().contains('Could not reach')) {
+          // Plain http on port 443 is never right — drop the port too.
+          final plain = a.host.replaceFirst('https://', 'http://').replaceFirst(RegExp(r':443(?=/|$)'), '');
+          a = Account(type: a.type, host: plain,
+              username: a.username, password: a.password, epgUrl: a.epgUrl);
+          await ChannelRepo.I.load(a, fallbackEpg: Branding.I.epgUrl);
+        } else {
+          rethrow;
+        }
+      }
+
+      final server = ServerConfig(
+        id: DateTime.now().microsecondsSinceEpoch.toRadixString(36),
+        nickname: mode == SourceType.xtream ? _hostLabel(a.host) : 'M3U playlist',
+        account: a,
+      );
+      await Storage.addServer(server);
+      await Storage.setActiveServerId(server.id);
+      ChannelRepo.I.activeServer = server;
+
+      if (!mounted) return;
+      Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const HomeScreen()));
+    } catch (e) {
+      if (mounted) await showError(context, e);
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  String _norm(String s) {
+    s = s.trim();
+    if (!s.startsWith('http')) s = 'http://$s';
+    return s;
+  }
+
+  static String _hostLabel(String host) => host.replaceFirst(RegExp(r'^https?://'), '').split('/').first;
+
+  @override
+  Widget build(BuildContext context) {
+    final b = Branding.I;
+    final hasPortals = b.portals.isNotEmpty;
+    return Scaffold(
+      body: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 640),
+          child: Padding(
+            padding: const EdgeInsets.all(32),
+            child: ListView(shrinkWrap: true, children: [
+              Text(b.appName, textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 44, fontWeight: FontWeight.bold, color: b.primaryColor)),
+              const SizedBox(height: 24),
+              // Movies & series come from the Xtream API; an M3U link can't
+              // supply them, so a VOD-only app doesn't offer that choice.
+              if (!b.vodOnly) ...[
+                SegmentedButton<SourceType>(
+                  segments: const [
+                    ButtonSegment(value: SourceType.xtream, label: Text('Xtream login'), icon: Icon(Icons.login)),
+                    ButtonSegment(value: SourceType.m3u, label: Text('M3U playlist'), icon: Icon(Icons.playlist_play)),
+                  ],
+                  selected: {mode},
+                  onSelectionChanged: (s) => setState(() => mode = s.first),
+                ),
+                const SizedBox(height: 24),
+              ],
+              if (mode == SourceType.xtream) ...[
+                if (hasPortals) ...[
+                  DropdownButtonFormField<Portal?>(
+                    initialValue: manualHost ? null : picked,
+                    decoration: const InputDecoration(labelText: 'Server', border: OutlineInputBorder()),
+                    dropdownColor: const Color(0xFF20242f),
+                    items: [
+                      for (final p in b.portals) DropdownMenuItem(value: p, child: Text(p.name)),
+                      const DropdownMenuItem(value: null, child: Text('Other server…')),
+                    ],
+                    onChanged: (p) => setState(() {
+                      if (p == null) { manualHost = true; host.text = ''; }
+                      else { manualHost = false; picked = p; host.text = p.host; }
+                    }),
+                  ),
+                  const SizedBox(height: 14),
+                  if (manualHost) TvTextField(controller: host, label: 'Server URL (http://host:port)', autofocus: true),
+                ] else
+                  TvTextField(controller: host, label: 'Server URL (http://host:port)', autofocus: true),
+                TvTextField(controller: user, label: 'Username', autofocus: hasPortals && !manualHost),
+                TvTextField(controller: pass, label: 'Password', obscure: true,
+                    last: !showEpg, onDone: _toSignIn),
+                if (showEpg)
+                  TvTextField(controller: epg, label: 'EPG URL (optional XMLTV)', last: true, onDone: _toSignIn),
+              ] else ...[
+                TvTextField(controller: m3u, label: 'Playlist URL (.m3u / .m3u8)', autofocus: true),
+                TvTextField(controller: epg, label: 'EPG URL (optional XMLTV)', last: true, onDone: _toSignIn),
+              ],
+              const SizedBox(height: 20),
+              busy
+                  ? const Center(child: CircularProgressIndicator())
+                  : KeyedSubtree(
+                      key: _signInKey,
+                      child: TvButton(label: 'Sign in', icon: Icons.play_arrow, onPressed: _go, focusNode: _signIn),
+                    ),
+              if (mode == SourceType.xtream && !showEpg)
+                TextButton(
+                  onPressed: () => setState(() => showEpg = true),
+                  child: const Text('Add a custom EPG URL (optional)', style: TextStyle(color: Colors.white54)),
+                ),
+              const SizedBox(height: 8),
+              Text(b.supportText, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white54)),
+            ]),
+          ),
+        ),
+      ),
+    );
+  }
+}

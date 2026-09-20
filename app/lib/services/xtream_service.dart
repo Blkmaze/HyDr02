@@ -1,0 +1,263 @@
+import 'dart:convert';
+import 'dart:isolate';
+import 'package:http/http.dart' as http;
+import '../models/account.dart';
+import '../models/channel.dart';
+import '../models/vod.dart';
+
+/// Minimal Xtream Codes "player_api.php" client.
+class XtreamService {
+  final Account acct;
+  XtreamService(this.acct);
+
+  String get _base => acct.host.replaceAll(RegExp(r'/+$'), '');
+
+  Uri _api([String? action, Map<String, String>? extra]) => Uri.parse(
+      '$_base/player_api.php?username=${Uri.encodeComponent(acct.username)}'
+      '&password=${Uri.encodeComponent(acct.password)}'
+      '${action == null ? '' : '&action=$action'}'
+      '${extra == null ? '' : extra.entries.map((e) => '&${e.key}=${Uri.encodeComponent(e.value)}').join()}');
+
+  /// [timeout] defaults to 20s; the VOD/series catalogs can be tens of MB
+  /// of JSON on a big provider, so those calls pass a much longer one.
+  Future<dynamic> _get(Uri u, {Duration timeout = const Duration(seconds: 20)}) async {
+    final body = await _getBody(u, timeout: timeout);
+    // Decode off the UI thread. A big provider's catalog is tens of MB of
+    // JSON; decoding that on the main isolate froze the remote for the
+    // better part of a minute and got the app killed with an ANR.
+    return Isolate.run(() => _decode(body));
+  }
+
+  Future<String> _getBody(Uri u, {Duration timeout = const Duration(seconds: 20)}) async {
+    http.Response r;
+    try {
+      r = await http.get(u).timeout(timeout);
+    } catch (e) {
+      throw Exception('Could not reach ${u.host}:${u.port} — ${_plain(e)}');
+    }
+    if (r.statusCode != 200) throw Exception('Portal answered HTTP ${r.statusCode}');
+    return r.body;
+  }
+
+  static dynamic _decode(String body) {
+    try {
+      return jsonDecode(body);
+    } catch (_) {
+      throw Exception('Portal did not return JSON — check the server URL and port');
+    }
+  }
+
+  static Map<String, String> _catMap(dynamic cats) => {
+    for (final c in (cats as List)) c['category_id'].toString(): (c['category_name'] ?? '').toString()
+  };
+
+  /// Strip the URL (carries credentials) and the raw OS-level address/port
+  /// noise out of socket error text — that "port" is often just the local
+  /// ephemeral port the OS picked for the outgoing connection, not a second
+  /// real target, and showing it next to our own host:port only confuses
+  /// what actually failed.
+  static String _plain(Object e) => e
+      .toString()
+      .replaceAll(RegExp(r',?\s*uri=\S+'), '')
+      .replaceAll(RegExp(r',?\s*address\s*=\s*[^,]+,?\s*port\s*=\s*\d+'), '')
+      .replaceFirst('ClientException with ', '');
+
+  /// Throws with a readable message if the login is rejected.
+  Future<Map<String, dynamic>> login() async {
+    final j = await _get(_api()) as Map<String, dynamic>;
+    final info = j['user_info'] as Map<String, dynamic>?;
+    if (info == null || info['auth'] != 1) {
+      throw Exception('Login rejected by portal (check host, username, password)');
+    }
+    if (info['status'] != null && info['status'] != 'Active') {
+      throw Exception('Account status: ${info['status']}');
+    }
+    return info;
+  }
+
+  Future<List<Channel>> liveChannels() async {
+    final catName = _catMap(await _get(_api('get_live_categories')));
+    final body = await _getBody(_api('get_live_streams'), timeout: const Duration(seconds: 60));
+    // Parse + build the model list in a worker isolate (see _get).
+    final base = _base, user = acct.username, pass = acct.password;
+    return Isolate.run(() => _parseLive(body, catName, base, user, pass));
+  }
+
+  static List<Channel> _parseLive(String body, Map<String, String> catName, String base, String user, String pass) {
+    final streams = _decode(body) as List;
+    return streams.map((s) {
+      final id = s['stream_id'].toString();
+      return Channel(
+        id: id,
+        name: (s['name'] ?? '').toString(),
+        group: catName[s['category_id']?.toString()] ?? 'Other',
+        logo: (s['stream_icon'] ?? '').toString(),
+        streamUrl: '$base/live/$user/$pass/$id.ts',
+        epgId: (s['epg_channel_id'] ?? '').toString(),
+        tvArchive: (s['tv_archive'] ?? 0).toString() == '1',
+        tvArchiveDuration: int.tryParse((s['tv_archive_duration'] ?? '0').toString()) ?? 0,
+      );
+    }).toList();
+  }
+
+  String get epgUrl => '$_base/xmltv.php?username=${Uri.encodeComponent(acct.username)}'
+      '&password=${Uri.encodeComponent(acct.password)}';
+
+  // ---- VOD (movies) --------------------------------------------------------
+
+  Future<List<VodItem>> vodItems() async {
+    final catName = _catMap(await _get(_api('get_vod_categories'), timeout: const Duration(seconds: 60)));
+    final body = await _getBody(_api('get_vod_streams'), timeout: const Duration(seconds: 120));
+    final base = _base, user = acct.username, pass = acct.password;
+    return Isolate.run(() => _parseVod(body, catName, base, user, pass));
+  }
+
+  static List<VodItem> _parseVod(String body, Map<String, String> catName, String base, String user, String pass) {
+    final streams = _decode(body) as List;
+    return streams.map((s) {
+      final id = s['stream_id'].toString();
+      final ext = (s['container_extension'] ?? 'mp4').toString();
+      return VodItem(
+        id: id,
+        name: (s['name'] ?? '').toString(),
+        group: catName[s['category_id']?.toString()] ?? 'Other',
+        cover: (s['stream_icon'] ?? s['cover'] ?? '').toString(),
+        streamUrl: '$base/movie/$user/$pass/$id.$ext',
+        // plot deliberately omitted here: thousands of descriptions in memory
+        // is what pushes small TV boxes over the limit. The detail page loads it.
+        rating: _rating(s),
+        added: _int(s['added']),
+        year: _year(s),
+      );
+    }).toList();
+  }
+
+  // ---- Series ---------------------------------------------------------------
+
+  Future<List<SeriesItem>> seriesItems() async {
+    final catName = _catMap(await _get(_api('get_series_categories'), timeout: const Duration(seconds: 60)));
+    final body = await _getBody(_api('get_series'), timeout: const Duration(seconds: 120));
+    return Isolate.run(() => _parseSeries(body, catName));
+  }
+
+  static List<SeriesItem> _parseSeries(String body, Map<String, String> catName) {
+    final list = _decode(body) as List;
+    return list.map((s) {
+      return SeriesItem(
+        id: s['series_id'].toString(),
+        name: (s['name'] ?? '').toString(),
+        group: catName[s['category_id']?.toString()] ?? 'Other',
+        cover: (s['cover'] ?? '').toString(),
+        rating: _rating(s),
+        added: _int(s['last_modified'] ?? s['added']),
+        year: _year(s),
+      );
+    }).toList();
+  }
+
+  /// Episodes for one series, flattened and sorted by season then episode
+  /// number. Xtream returns these grouped by season under "episodes".
+  Future<VodInfo> vodInfo(String vodId) async {
+    final j = await _get(_api('get_vod_info', {'vod_id': vodId})) as Map<String, dynamic>;
+    return _infoFrom(j);
+  }
+
+  /// Same shape as vodInfo but for a series: plot, cast, genre, rating and
+  /// backdrop. Xtream's get_series_info carries an "info" block just like
+  /// get_vod_info does, so the two parse identically.
+  Future<VodInfo> seriesInfo(String seriesId) async {
+    final j = await _get(_api('get_series_info', {'series_id': seriesId})) as Map<String, dynamic>;
+    return _infoFrom(j);
+  }
+
+  VodInfo _infoFrom(Map<String, dynamic> j) {
+    final info = (j['info'] is Map) ? j['info'] as Map : const {};
+    String str(String k) => (info[k] ?? '').toString();
+    String backdrop = '';
+    final bd = info['backdrop_path'];
+    if (bd is List && bd.isNotEmpty) backdrop = bd.first.toString();
+    if (bd is String) backdrop = bd;
+    return VodInfo(
+      plot: str('plot').isNotEmpty ? str('plot') : str('description'),
+      cast: str('cast').isNotEmpty ? str('cast') : str('actors'),
+      director: str('director'),
+      genre: str('genre'),
+      duration: str('duration'),
+      rating: _rating(info),
+      backdrop: backdrop,
+      trailer: str('youtube_trailer').isNotEmpty ? str('youtube_trailer') : str('trailer'),
+    );
+  }
+
+  Future<List<SeriesEpisode>> seriesEpisodes(String seriesId) async {
+    final j = await _get(_api('get_series_info', {'series_id': seriesId})) as Map<String, dynamic>;
+    final episodes = <SeriesEpisode>[];
+    final eps = j['episodes'];
+    if (eps is Map) {
+      for (final season in eps.entries) {
+        final list = season.value;
+        if (list is! List) continue;
+        for (final e in list) {
+          final id = e['id'].toString();
+          final ext = (e['container_extension'] ?? 'mp4').toString();
+          episodes.add(SeriesEpisode(
+            id: id,
+            title: (e['title'] ?? '').toString(),
+            season: int.tryParse(season.key.toString()) ?? 0,
+            episode: int.tryParse((e['episode_num'] ?? '0').toString()) ?? 0,
+            streamUrl: '$_base/series/${acct.username}/${acct.password}/$id.$ext',
+          ));
+        }
+      }
+    }
+    episodes.sort((a, b) =>
+        a.season != b.season ? a.season.compareTo(b.season) : a.episode.compareTo(b.episode));
+    return episodes;
+  }
+
+  // ---- Catchup / timeshift ----------------------------------------------
+
+  /// URL for [minutes] of catchup on [ch] starting at [start] (portal-local
+  /// wall clock — Xtream's timeshift endpoint expects the server's own time,
+  /// which for the vast majority of portals is effectively UTC-adjacent; if
+  /// a portal returns a shifted result, adjust the channel's server offset
+  /// in a future update).
+  String catchupUrl(Channel ch, DateTime start, int minutes) {
+    final s = start;
+    final stamp = '${s.year.toString().padLeft(4, '0')}-${s.month.toString().padLeft(2, '0')}-'
+        '${s.day.toString().padLeft(2, '0')}:${s.hour.toString().padLeft(2, '0')}-${s.minute.toString().padLeft(2, '0')}';
+    final dur = minutes < 1 ? 1 : minutes;
+    return '$_base/timeshift/${acct.username}/${acct.password}/$dur/$stamp/${ch.id}.ts';
+  }
+
+  // ---- tolerant parsing of the loosely-typed fields portals send ---------
+
+  /// Prefers the 0–10 "rating"; falls back to "rating_5based" x2.
+  static double _rating(Map s) {
+    final r = double.tryParse((s['rating'] ?? '').toString());
+    if (r != null && r > 0) return r > 10 ? 10 : r;
+    final r5 = double.tryParse((s['rating_5based'] ?? '').toString());
+    if (r5 != null && r5 > 0) return (r5 * 2).clamp(0, 10).toDouble();
+    return 0;
+  }
+
+  static int _int(Object? v) => int.tryParse((v ?? '').toString()) ?? 0;
+
+  /// Year from "year", "release_date"/"releaseDate" (yyyy-…), or a trailing
+  /// "(2024)" in the title — providers are inconsistent about where it lives.
+  static final _yearAnyRe = RegExp(r'(19|20)\d{2}');
+  static final _yearWordRe = RegExp(r'\b(19|20)\d{2}\b');
+  static int _year(Map s) {
+    for (final k in const ['year', 'release_date', 'releaseDate', 'releasedate', 'released']) {
+      final v = s[k];
+      if (v == null) continue;
+      final m = _yearAnyRe.firstMatch(v.toString());
+      if (m != null) return int.parse(m.group(0)!);
+    }
+    // "(2024)", "[2024]", or a bare "2024" anywhere in the title
+    final name = (s['name'] ?? s['title'] ?? '').toString();
+    final m = _yearWordRe.allMatches(name).toList();
+    if (m.isNotEmpty) return int.parse(m.last.group(0)!);
+    return 0;
+  }
+}

@@ -1,0 +1,503 @@
+import 'dart:async';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+/// A list row that visibly highlights when the D-pad focus lands on it.
+class TvTile extends StatefulWidget {
+  final Widget title;
+  final Widget? subtitle;
+  final Widget? leading;
+  final Widget? trailing;
+  final VoidCallback onSelect;
+  final VoidCallback? onLongSelect;
+  final ValueChanged<bool>? onFocusChange;
+  final bool autofocus;
+  final bool selected;
+
+  const TvTile({
+    super.key,
+    required this.title,
+    required this.onSelect,
+    this.onLongSelect,
+    this.onFocusChange,
+    this.subtitle,
+    this.leading,
+    this.trailing,
+    this.autofocus = false,
+    this.selected = false,
+  });
+
+  @override
+  State<TvTile> createState() => _TvTileState();
+}
+
+class _TvTileState extends State<TvTile> {
+  Timer? _holdTimer;
+  bool _longFired = false;
+  bool _hasFocus = false;
+
+  static final _activateKeys = {
+    LogicalKeyboardKey.select, LogicalKeyboardKey.enter, LogicalKeyboardKey.numpadEnter,
+    LogicalKeyboardKey.gameButtonA, LogicalKeyboardKey.space,
+  };
+
+  /// A held OK/Enter on a physical remote arrives as a KeyDownEvent then,
+  /// later, a KeyUpEvent — there's no touch "long press" gesture to detect,
+  /// which is why InkWell.onLongPress alone never fires from a remote.
+  /// This starts our own timer on key-down and, if the key is still down
+  /// when it fires, calls onLongSelect and swallows the eventual key-up so
+  /// the normal short-press select doesn't also fire for the same hold.
+  ///
+  /// Crucially, a normal short press that navigates away (e.g. OK to play)
+  /// moves focus to the new screen BEFORE the key-up arrives — so this tile
+  /// never sees that key-up. Without the focus checks below, the timer would
+  /// fire anyway and long-select every channel you simply tuned to.
+  KeyEventResult _handleKey(FocusNode node, KeyEvent event) {
+    if (widget.onLongSelect == null || !_activateKeys.contains(event.logicalKey)) {
+      return KeyEventResult.ignored;
+    }
+    // We own OK entirely for tiles that have a long-press action: the
+    // button's built-in activation fires on key-DOWN, which would always beat
+    // the hold timer (and navigate away before it can fire). So: start the
+    // timer on down, decide on up. Released early → select; held → long.
+    if (event is KeyDownEvent) {
+      _longFired = false;
+      _holdTimer?.cancel();
+      _holdTimer = Timer(const Duration(milliseconds: 550), () {
+        if (!mounted || !_hasFocus) return;
+        _longFired = true;
+        widget.onLongSelect!();
+      });
+      return KeyEventResult.handled;
+    }
+    if (event is KeyRepeatEvent) return KeyEventResult.handled; // holding: keep waiting
+    if (event is KeyUpEvent) {
+      _holdTimer?.cancel();
+      if (_longFired) {
+        _longFired = false;          // long-press already acted
+      } else {
+        widget.onSelect();           // a normal, short press
+      }
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  void _onFocusChange(bool has) {
+    _hasFocus = has;
+    if (!has) {
+      // Leaving the tile cancels any pending long-press — the key-up that
+      // would normally cancel it is going to land on whatever now has focus.
+      _holdTimer?.cancel();
+      _longFired = false;
+    }
+  }
+
+  @override
+  void dispose() {
+    _holdTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final primary = Theme.of(context).colorScheme.primary;
+    // Outer Focus only observes (+ intercepts hold-to-favorite); the InkWell
+    // owns the real focus node so OK/Enter on the remote fires onSelect.
+    return Focus(
+      canRequestFocus: false,
+      skipTraversal: true,
+      onKeyEvent: _handleKey,
+      child: Builder(builder: (ctx) {
+        final focused = Focus.of(ctx).hasFocus;
+        return InkWell(
+          autofocus: widget.autofocus,
+          onFocusChange: (has) {
+            _onFocusChange(has);
+            // Keep the focused row on screen when the remote moves focus
+            // past the edge of what's currently visible.
+            if (has) {
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                if (ctx.mounted) {
+                  Scrollable.maybeOf(ctx)?.position.ensureVisible(
+                        ctx.findRenderObject()!,
+                        alignment: 0.5,
+                        duration: const Duration(milliseconds: 150),
+                      );
+                }
+              });
+            }
+            widget.onFocusChange?.call(has);
+          },
+          onTap: widget.onSelect,
+          onLongPress: widget.onLongSelect, // still works for touch/mouse testing
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 120),
+            decoration: BoxDecoration(
+              color: focused
+                  ? primary.withOpacity(0.85)
+                  : widget.selected
+                      ? Colors.white.withOpacity(0.08)
+                      : Colors.transparent,
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: ListTile(
+              leading: widget.leading,
+              title: widget.title,
+              subtitle: widget.subtitle,
+              trailing: widget.trailing,
+              textColor: focused ? Colors.white : null,
+            ),
+          ),
+        );
+      }),
+    );
+  }
+}
+
+/// One entry in a collapsible icon nav rail (see [TvNavRail]) — just an
+/// icon when collapsed, icon + label when expanded.
+class TvRailTile extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final bool expanded;
+  final VoidCallback onSelect;
+  final bool autofocus;
+  final bool selected;
+  final FocusNode? focusNode;
+
+  const TvRailTile({
+    super.key,
+    required this.icon,
+    required this.label,
+    required this.expanded,
+    required this.onSelect,
+    this.autofocus = false,
+    this.selected = false,
+    this.focusNode,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final primary = Theme.of(context).colorScheme.primary;
+    return Focus(
+      canRequestFocus: false,
+      skipTraversal: true,
+      child: Builder(builder: (ctx) {
+        final focused = Focus.of(ctx).hasFocus;
+        return Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+          child: Material(
+            color: Colors.transparent,
+            borderRadius: BorderRadius.circular(8),
+            child: InkWell(
+              autofocus: autofocus,
+              focusNode: focusNode,
+              onTap: onSelect,
+              borderRadius: BorderRadius.circular(8),
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 150),
+                height: 48,
+                padding: const EdgeInsets.symmetric(horizontal: 14),
+                decoration: BoxDecoration(
+                  color: focused
+                      ? primary.withOpacity(0.85)
+                      : selected
+                          ? Colors.white.withOpacity(0.08)
+                          : Colors.transparent,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(children: [
+                  Icon(icon, color: focused ? Colors.white : Colors.white70, size: 22),
+                  if (expanded) ...[
+                    const SizedBox(width: 16),
+                    Expanded(
+                      child: Text(label,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(color: focused ? Colors.white : Colors.white70, fontSize: 16)),
+                    ),
+                  ],
+                ]),
+              ),
+            ),
+          ),
+        );
+      }),
+    );
+  }
+}
+
+/// A vertical icon rail that expands to show labels while D-pad focus is
+/// anywhere inside it, and collapses back to icon-only once focus moves on
+/// (e.g. into the categories list or channel grid) — like a typical TV app's
+/// side nav.
+class TvNavRail extends StatefulWidget {
+  final List<Widget> Function(bool expanded) itemsBuilder;
+  const TvNavRail({super.key, required this.itemsBuilder});
+
+  @override
+  State<TvNavRail> createState() => _TvNavRailState();
+}
+
+class _TvNavRailState extends State<TvNavRail> {
+  bool expanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return Focus(
+      canRequestFocus: false,
+      skipTraversal: true,
+      onFocusChange: (has) => setState(() => expanded = has),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 180),
+        curve: Curves.easeOut,
+        width: expanded ? 220 : 76,
+        child: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: widget.itemsBuilder(expanded),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class TvButton extends StatelessWidget {
+  final String label;
+  final IconData? icon;
+  final VoidCallback onPressed;
+  final bool autofocus;
+  final FocusNode? focusNode;
+  const TvButton({super.key, required this.label, required this.onPressed, this.icon, this.autofocus = false, this.focusNode});
+
+  @override
+  Widget build(BuildContext context) {
+    return FilledButton.icon(
+      autofocus: autofocus,
+      focusNode: focusNode,
+      onPressed: onPressed,
+      icon: Icon(icon ?? Icons.chevron_right),
+      label: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 6),
+        child: Text(label, style: const TextStyle(fontSize: 20)),
+      ),
+    );
+  }
+}
+
+class ChannelLogo extends StatelessWidget {
+  final String url;
+  final double size;
+  const ChannelLogo(this.url, {super.key, this.size = 44});
+  @override
+  Widget build(BuildContext context) {
+    if (url.isEmpty) return Icon(Icons.tv, size: size * 0.8);
+    return SizedBox(
+      width: size, height: size,
+      child: Image.network(url, fit: BoxFit.contain,
+          errorBuilder: (_, __, ___) => Icon(Icons.tv, size: size * 0.8)),
+    );
+  }
+}
+
+/// A focus-aware poster tile for grid browsing (Movies/Series covers).
+class PosterTile extends StatelessWidget {
+  final String title;
+  final String cover;
+  final VoidCallback onSelect;
+  final bool autofocus;
+  final ValueChanged<bool>? onFocusChange;
+  const PosterTile({super.key, required this.title, required this.cover, required this.onSelect,
+      this.autofocus = false, this.onFocusChange});
+
+  @override
+  Widget build(BuildContext context) {
+    final primary = Theme.of(context).colorScheme.primary;
+    return Focus(
+      canRequestFocus: false,
+      skipTraversal: true,
+      child: Builder(builder: (ctx) {
+        final focused = Focus.of(ctx).hasFocus;
+        return InkWell(
+          autofocus: autofocus,
+          onFocusChange: (has) {
+            // Glide the row so the highlighted poster sits centred, instead
+            // of the default jump-to-edge.
+            if (has) {
+              Scrollable.ensureVisible(ctx, alignment: 0.5,
+                  duration: const Duration(milliseconds: 220), curve: Curves.easeOutCubic);
+            }
+            onFocusChange?.call(has);
+          },
+          onTap: onSelect,
+          borderRadius: BorderRadius.circular(8),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            Expanded(
+              child: AnimatedScale(
+                scale: focused ? 1.06 : 1.0,
+                duration: const Duration(milliseconds: 160),
+                curve: Curves.easeOutCubic,
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 160),
+                  curve: Curves.easeOutCubic,
+                  clipBehavior: Clip.antiAlias,
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(8),
+                    color: Colors.white10,
+                    border: Border.all(color: focused ? primary : Colors.transparent, width: 3),
+                    boxShadow: focused
+                        ? [BoxShadow(color: primary.withOpacity(0.45), blurRadius: 14, spreadRadius: 1)]
+                        : const [],
+                  ),
+                  child: cover.isEmpty
+                      ? const Center(child: Icon(Icons.movie, color: Colors.white24, size: 40))
+                      // Decode at roughly display size (posters are ~150px wide
+                      // on a 2x TV): a 1000px cover decoded full-size per tile
+                      // is what made rows stutter and eat memory.
+                      : Image.network(cover, fit: BoxFit.cover, cacheWidth: 320, filterQuality: FilterQuality.low,
+                          gaplessPlayback: true,
+                          errorBuilder: (_, __, ___) => const Center(child: Icon(Icons.movie, color: Colors.white24, size: 40))),
+                ),
+              ),
+            ),
+            const SizedBox(height: 6),
+            Text(title, maxLines: 2, overflow: TextOverflow.ellipsis, textAlign: TextAlign.center,
+                style: const TextStyle(fontSize: 13)),
+          ]),
+        );
+      }),
+    );
+  }
+}
+
+/// Strip anything that could expose credentials before text reaches the
+/// screen. Xtream stream URLs carry the username AND password in the path
+/// (/live/USER/PASS/123.ts), and mpv's playback errors echo the full URL
+/// back — so any raw error is a credential leak waiting to happen.
+String scrubSecrets(Object e) => e
+    .toString()
+    .replaceFirst('Exception: ', '')
+    .replaceAll(RegExp(r'https?://\S+'), '[stream]')
+    // scheme-less path fragments mpv sometimes logs on their own
+    .replaceAllMapped(RegExp(r'/(live|movie|series|timeshift)/[^/\s]+/[^/\s]+/'), (m) => '/${m[1]}/[user]/[pass]/')
+    .replaceAll(RegExp(r',?\s*uri=\S+'), '')
+    .replaceAll(RegExp(r',?\s*address\s*=\s*[^,]+,?\s*port\s*=\s*\d+'), '');
+
+Future<void> showError(BuildContext context, Object e) => showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Something went wrong'),
+        content: Text(scrubSecrets(e)),
+        actions: [TextButton(autofocus: true, onPressed: () => Navigator.pop(context), child: const Text('OK'))],
+      ),
+    );
+
+/// TextField that behaves on a remote: Up/Down move to the previous/next
+/// field instead of moving the text cursor, and the keyboard's Next key
+/// also advances. Left/Right still move the cursor.
+class TvTextField extends StatefulWidget {
+  final TextEditingController controller;
+  final String label;
+  final bool obscure;
+  final bool autofocus;
+  final bool last;
+  /// Called when the keyboard's Done key is pressed on a [last] field —
+  /// use it to hand focus to the submit button.
+  final VoidCallback? onDone;
+  const TvTextField({super.key, required this.controller, required this.label,
+      this.obscure = false, this.autofocus = false, this.last = false, this.onDone});
+  @override
+  State<TvTextField> createState() => _TvTextFieldState();
+}
+
+class _TvTextFieldState extends State<TvTextField> {
+  /// Set when focus moved because of an arrow key. The field that receives
+  /// focus checks it and stays quiet — otherwise every field on the way up
+  /// or down would pop the keyboard and swallow the next arrow press.
+  static DateTime _quietUntil = DateTime.fromMillisecondsSinceEpoch(0);
+  static void _moveQuietly(void Function() move) {
+    _quietUntil = DateTime.now().add(const Duration(milliseconds: 400));
+    move();
+  }
+
+  /// While false the field is read-only, so moving onto it with the remote
+  /// never opens a keyboard. OK on the field, or arriving via the keyboard's
+  /// Next key, flips it on and opens the keyboard.
+  bool _typing = false;
+
+  late final FocusNode node = FocusNode(onKeyEvent: (n, e) {
+    if (e is! KeyDownEvent) return KeyEventResult.ignored;
+    final k = e.logicalKey;
+    if (k == LogicalKeyboardKey.arrowDown) { _moveQuietly(n.nextFocus); return KeyEventResult.handled; }
+    if (k == LogicalKeyboardKey.arrowUp) { _moveQuietly(n.previousFocus); return KeyEventResult.handled; }
+    if (k == LogicalKeyboardKey.select || k == LogicalKeyboardKey.enter ||
+        k == LogicalKeyboardKey.numpadEnter || k == LogicalKeyboardKey.gameButtonA) {
+      _startTyping();
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  });
+
+  @override
+  void initState() {
+    super.initState();
+    node.addListener(_onFocus);
+  }
+
+  void _onFocus() {
+    if (!node.hasFocus) {
+      if (mounted) setState(() => _typing = false);
+      return;
+    }
+    if (mounted) setState(() {}); // shows the "Press OK to type" hint
+    if (DateTime.now().isBefore(_quietUntil)) return; // arrived by arrow key: stay quiet
+    // Arrived by Next (or autofocus on the first field): keep typing going.
+    _startTyping();
+  }
+
+  void _startTyping() {
+    if (!node.hasFocus) node.requestFocus();
+    if (!_typing) setState(() => _typing = true);
+    // Flutter opens the keyboard when readOnly flips off; this is a backstop
+    // for Fire OS builds that need a second nudge.
+    Future.delayed(const Duration(milliseconds: 150), () {
+      if (mounted && node.hasFocus) SystemChannels.textInput.invokeMethod('TextInput.show');
+    });
+  }
+
+  @override
+  void dispose() { node.removeListener(_onFocus); node.dispose(); super.dispose(); }
+
+  @override
+  Widget build(BuildContext context) {
+    final primary = Theme.of(context).colorScheme.primary;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 14),
+      child: TextField(
+        controller: widget.controller,
+        focusNode: node,
+        obscureText: widget.obscure,
+        autofocus: widget.autofocus,
+        // Read-only while navigating: Flutter opens no input connection for
+        // a read-only field, so no keyboard. Flipping readOnly off while the
+        // field has focus is the path Flutter itself uses to open one —
+        // reliable on Fire OS where a keyboard-type switch was ignored.
+        readOnly: !_typing,
+        keyboardType: widget.obscure ? TextInputType.visiblePassword : TextInputType.url,
+        textInputAction: widget.last ? TextInputAction.done : TextInputAction.next,
+        // Next already moves focus on its own (doing it here too skipped a
+        // field). Done just closes the keyboard, so that one gets a hook.
+        onSubmitted: widget.last && widget.onDone != null ? (_) => widget.onDone!() : null,
+        style: const TextStyle(fontSize: 20),
+        decoration: InputDecoration(
+          labelText: widget.label,
+          border: const OutlineInputBorder(),
+          helperText: node.hasFocus && !_typing ? 'Press OK to type' : null,
+          helperStyle: TextStyle(color: primary),
+        ),
+      ),
+    );
+  }
+}
