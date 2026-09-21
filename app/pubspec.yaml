@@ -15,7 +15,12 @@ dependencies:
   http: ^1.2.0
   shared_preferences: ^2.2.2
   flutter_secure_storage: ^9.2.2
-  wakelock_plus: ^1.2.8
+  # Deliberately NOT a caret constraint. wakelock_plus 1.3+ requires
+  # package_info_plus 10.x, which collides with the ^8.0.0 pin above and
+  # fails resolution ("tried to update package_info_plus"). The 1.2.x line
+  # accepts package_info_plus <9.0.0 and does everything needed here.
+  # If you ever widen this, bump package_info_plus in the same commit.
+  wakelock_plus: ">=1.2.8 <1.3.0"
   xml: ^6.5.0
   package_info_plus: ^8.0.0
   openvpn_flutter: ^1.3.4
