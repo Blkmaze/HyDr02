@@ -54,10 +54,16 @@ class _CodeSignInScreenState extends State<CodeSignInScreen> {
       final r = await http.get(_fn('pair-check').replace(queryParameters: {'code': code}));
       if (r.statusCode == 404) return; // not claimed yet
       final j = jsonDecode(r.body);
+      // Only a reply that actually carries a server address means "claimed".
+      // A pending slot, an error body, or a pairing backend whose response
+      // shape doesn't match ours would otherwise sail through and fail much
+      // later as a confusing "Could not reach :0" from the Xtream client.
+      final host = (j is Map ? (j['host'] ?? '') : '').toString().trim();
+      if (host.isEmpty) return; // keep polling
       poll?.cancel();
       var a = Account(
         type: j['type'] == 'm3u' ? SourceType.m3u : SourceType.xtream,
-        host: j['host'] ?? '', username: j['username'] ?? '', password: j['password'] ?? '',
+        host: host, username: j['username'] ?? '', password: j['password'] ?? '',
       );
       setState(() => status = 'Signing in…');
       await ChannelRepo.I.load(a, fallbackEpg: Branding.I.epgUrl);
