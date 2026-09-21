@@ -160,7 +160,12 @@ class _HomeHeroState extends State<HomeHero> {
                         : Image.network(
                             backdrop,
                             key: ValueKey(backdrop),
-                            cacheWidth: 900,
+                            // The hero fills roughly 1100 physical px on a
+                            // 1080p panel, so 900 was decoding below native
+                            // and softening the art. Drop this back toward
+                            // 900 if a lower-powered Stick runs short on
+                            // memory; a Cube handles it fine.
+                            cacheWidth: 1280,
                             fit: BoxFit.cover,
                             width: double.infinity,
                             height: double.infinity,
@@ -177,7 +182,11 @@ class _HomeHeroState extends State<HomeHero> {
                   gradient: LinearGradient(
                     begin: Alignment.centerLeft,
                     end: Alignment.centerRight,
-                    stops: const [0.0, 0.38, 0.62, 1.0],
+                    // Tune these two middle stops to trade art clarity against
+                    // title legibility: the first is where the solid panel
+                    // ends, the second where the art is fully clear. Lower
+                    // numbers = more artwork showing.
+                    stops: const [0.0, 0.34, 0.54, 1.0],
                     colors: [panel, panel, panel.withOpacity(0.0), panel.withOpacity(0.0)],
                   ),
                 ),
@@ -190,7 +199,9 @@ class _HomeHeroState extends State<HomeHero> {
                   gradient: LinearGradient(
                     begin: Alignment.topCenter,
                     end: Alignment.bottomCenter,
-                    colors: [Colors.transparent, panel.withOpacity(0.6)],
+                    // Bottom shade, purely for readability over bright art.
+                    // Raise back toward 0.6 if text ever gets hard to read.
+                    colors: [Colors.transparent, panel.withOpacity(0.3)],
                   ),
                 ),
               ),

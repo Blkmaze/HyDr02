@@ -1,6 +1,39 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 import '../config/branding.dart';
+
+/// Held by any screen that's actually playing video. While at least one hold
+/// is active, two things are true:
+///   * the in-app idle screensaver below never fades in, and
+///   * the device is asked to keep the screen on, so Fire TV / Android TV's
+///     own ambient mode and display sleep stay out of the way too.
+///
+/// Both are released as soon as the last player screen closes, so the normal
+/// idle behaviour (and burn-in protection) comes back when you stop watching.
+/// Call [acquire] in a player's initState and [release] in its dispose.
+class KeepAwake {
+  static final ValueNotifier<int> holds = ValueNotifier<int>(0);
+
+  static void acquire() {
+    holds.value++;
+    if (holds.value == 1) _setWakelock(true);
+  }
+
+  static void release() {
+    if (holds.value == 0) return;
+    holds.value--;
+    if (holds.value == 0) _setWakelock(false);
+  }
+
+  // Best-effort: a device or plugin version that can't do this shouldn't take
+  // playback down with it.
+  static Future<void> _setWakelock(bool on) async {
+    try {
+      await WakelockPlus.toggle(enable: on);
+    } catch (_) {/* ignore */}
+  }
+}
 
 /// Wraps the whole app (see `builder:` in main.dart). After [idleAfter] with
 /// no remote-control input at all, fades in a low-brightness screensaver
@@ -35,19 +68,28 @@ class _IdleWatcherState extends State<IdleWatcher> {
   @override
   void initState() {
     super.initState();
+    KeepAwake.holds.addListener(_onHoldsChanged);
     _resetTimer();
   }
 
   @override
   void dispose() {
+    KeepAwake.holds.removeListener(_onHoldsChanged);
     _timer?.cancel();
     _focusNode.dispose();
     super.dispose();
   }
 
+  /// Playback started or stopped: drop the screensaver and stop counting
+  /// while something is playing, resume counting once it ends.
+  void _onHoldsChanged() => _resetTimer();
+
   void _resetTimer([dynamic _]) {
     _timer?.cancel();
     if (_idle) setState(() => _idle = false);
+    // Don't count down at all while video is playing — sitting still through
+    // a two-hour movie is not "idle".
+    if (KeepAwake.holds.value > 0) return;
     _timer = Timer(widget.idleAfter, () {
       if (mounted) setState(() => _idle = true);
     });

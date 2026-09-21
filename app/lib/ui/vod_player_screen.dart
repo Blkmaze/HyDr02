@@ -6,6 +6,7 @@ import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import '../models/vod.dart';
 import '../services/storage.dart';
+import 'idle_screensaver.dart';
 import 'tv_widgets.dart';
 
 /// Full-screen movie player with remote-friendly controls.
@@ -47,6 +48,7 @@ class _VodPlayerScreenState extends State<VodPlayerScreen> {
   @override
   void initState() {
     super.initState();
+    KeepAwake.acquire(); // no screensaver / no display sleep while watching
     _subs.add(player.stream.error.listen((e) {
       if (mounted && !isTransientPlayerError(e)) setState(() => error = e);
     }));
@@ -115,6 +117,7 @@ class _VodPlayerScreenState extends State<VodPlayerScreen> {
 
   @override
   void dispose() {
+    KeepAwake.release();
     _savePosition();
     _hide?.cancel();
     _saveTimer?.cancel();

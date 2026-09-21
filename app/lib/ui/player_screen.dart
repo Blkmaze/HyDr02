@@ -9,6 +9,7 @@ import '../models/channel.dart';
 import '../services/channel_repo.dart';
 import '../services/live_stream_tuning.dart';
 import '../services/storage.dart';
+import 'idle_screensaver.dart';
 import 'tv_widgets.dart';
 
 /// Settings > Player toggle — some Android TV boxes hang with a black
@@ -52,6 +53,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   @override
   void initState() {
     super.initState();
+    KeepAwake.acquire(); // no screensaver / no display sleep while watching
     tuneForLiveTs(player);
     player.stream.error.listen(_onPlayerError);
     player.stream.buffering.listen((b) {
@@ -165,6 +167,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   @override
   void dispose() {
+    KeepAwake.release();
     hideTimer?.cancel();
     _digitTimer?.cancel();
     _stallTimer?.cancel();

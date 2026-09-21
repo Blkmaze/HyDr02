@@ -54,8 +54,12 @@ Future<void> tuneForLiveTs(Player player, {bool preview = false}) async {
   // Settings → Player → Buffer size. Small suits low-RAM sticks; large rides
   // out rough connections at the cost of a slower channel start.
   final level = await Storage.bufferLevel();
-  final secs = preview ? '4' : ['6', '12', '20'][level.clamp(0, 2)];
-  final fwd  = preview ? '8MiB' : ['24MiB', '48MiB', '96MiB'][level.clamp(0, 2)];
+  // Seconds of read-ahead. Sports/fast action runs at several times the
+  // bitrate of studio content, so the same number of seconds costs far more
+  // bytes — the byte caps below have to keep up or they, not the seconds,
+  // become the real limit.
+  final secs = preview ? '4' : ['6', '12', '30'][level.clamp(0, 2)];
+  final fwd  = preview ? '8MiB' : ['24MiB', '64MiB', '128MiB'][level.clamp(0, 2)];
   final back = preview ? '2MiB' : ['4MiB', '8MiB', '16MiB'][level.clamp(0, 2)];
 
   final smooth = await Storage.smoothMotion();
@@ -83,7 +87,11 @@ Future<void> tuneForLiveTs(Player player, {bool preview = false}) async {
     // which looks exactly like a random crash.
     'cache': 'yes',
     'cache-pause-initial': 'yes',
-    'cache-pause-wait': '2',
+    // How much is re-buffered after an underrun before playback resumes.
+    // At 2s a marginal sports stream would refill, resume, and immediately
+    // underrun again — the constant stutter-stutter loop. Waiting longer
+    // trades one noticeable pause for several annoying ones.
+    'cache-pause-wait': preview ? '2' : '5',
     'demuxer-readahead-secs': secs,
     'demuxer-max-bytes': fwd,
     'demuxer-max-back-bytes': back,
